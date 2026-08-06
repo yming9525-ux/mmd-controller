@@ -15,10 +15,7 @@
 
 ## 安装
 
-> **别点绿色的 Code → Download ZIP**，那个是源码包，Blender 装不了，装完插件列表里什么都不显示。
-> 去右边 **[Releases](../../releases)** 下载 `mmd_controller_v1044.zip`，那个才是安装包。
-
-1. 从 Releases 下载 zip
+1. 到 [Releases](../../releases) 下载 `mmd_controller_v1044.zip`
 2. Blender 偏好设置 → 插件 → 安装，选中 zip
 3. 在列表里搜「MMD」，勾选启用
 
