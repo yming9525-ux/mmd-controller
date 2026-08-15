@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD 控制器 ",
     "author": "蛙灾 ",
-    "version": (10, 4, 4),
+    "version": (10, 5, 0),
     "blender": (5, 0, 0),
     "location": "3D Viewport > Sidebar > MMD IK/FK",
     "description": "控制器 + 表情面板",
@@ -13,7 +13,7 @@ import json
 import os
 from bpy.types import Panel, Operator
 from mathutils import Matrix, Vector
-from math import radians, pi, cos, sin
+from math import radians, degrees, pi, cos, sin
 from bpy.props import FloatProperty, PointerProperty, EnumProperty, BoolProperty, StringProperty
 
 # ============================================================
@@ -34,6 +34,20 @@ CTRL_PREFIX = "CTRL_"
 BEND_PREFIX = "BEND_"
 AUTO_PREFIX = "AUTO_"  # 手指自动驱动层：由 BEND 控制，CTRL 作为其子骨骼用于手动微调
 BIND_PREFIX = "BIND_"  # 绑定辅助层：按原骨静止位创建、挂在弯过的 IK_ 骨下，原骨 FOLLOW_IK 的实际目标
+# ── 每条肢体的弯曲方向控制方案（v10.5.0）──
+#   "pole"  : 极向量方向球 IKP_ + pole_angle（10.4.x 的老做法，手臂用它）
+#   "twist" : 链根骨绕自身长轴旋转，配 IKS_ 摆向骨稳住坐标轴（腿用它）
+# 手臂回退到 pole 是岁岁 2026-08-16 拍板的：转盘方案在手臂上弯曲不如老版正确。
+LIMB_BEND_MODE = {
+    "arm_L": "pole", "arm_R": "pole",
+    "leg_L": "twist", "leg_R": "twist",
+}
+
+def bend_mode(limb_key):
+    return LIMB_BEND_MODE.get(limb_key, "twist")
+
+IK_SWING_PREFIX = "IKS_"  # 摆向骨：阻尼追踪末端 IK 目标，稳住扭转控制器的坐标轴
+IK_REACH_PREFIX = "IKR_"  # 触及半径参照点：待在链根、不进 IK 链，给 IKT 的距离限制当圆心
 
 # 骨骼集合（Bone Collections）名称
 COLL_HIDDEN = "MMD_Hidden_Bones"
@@ -63,7 +77,9 @@ CONTROL_GROUP_COLLECTION = {
 
 EXTRA_CONTROL_BONES = [
     "全ての親",  # 新增总控骨骼
-    "センター", "センター2", "下半身", "上半身", "上半身2",
+    # v10.5.0：センター2 不再生成控制器（岁岁要求）。两根位置常常重叠，
+    # 生成两个圆环互相挡着，既看不清也点不中。只留 センター。
+    "センター", "下半身", "上半身", "上半身2",
     "首", "頭",
     "肩P.L", "肩P.R",   # 耸肩骨：VPD/VMD 常给它姿势，必须有控制器可见可清
     "手捩.L", "手捩.R",
@@ -124,12 +140,25 @@ def _move_to_shape_collection(obj):
 
 
 def create_custom_shape(name, shape_type):
-    if name in bpy.data.objects:
-        obj = bpy.data.objects[name]
-        _move_to_shape_collection(obj)
-        return obj
-    mesh = bpy.data.meshes.new(name)
-    obj = bpy.data.objects.new(name, mesh)
+    # 同名物体复用，但要认形状类型：插件升级换了画法时必须重建网格，
+    # 否则老工程重新生成拿到的还是旧形状（v10.5.0 换转盘时踩到的坑）
+    obj = bpy.data.objects.get(name)
+    if obj is not None:
+        if obj.get("mmd_shape_type") == shape_type:
+            _move_to_shape_collection(obj)
+            return obj
+        old_mesh = obj.data
+        mesh = bpy.data.meshes.new(name)
+        obj.data = mesh
+        try:
+            if old_mesh and old_mesh.users == 0:
+                bpy.data.meshes.remove(old_mesh)
+        except Exception:
+            pass
+    else:
+        mesh = bpy.data.meshes.new(name)
+        obj = bpy.data.objects.new(name, mesh)
+    obj["mmd_shape_type"] = shape_type
     _move_to_shape_collection(obj)
     obj.display_type = 'WIRE'
     obj.hide_viewport = True
@@ -195,6 +224,36 @@ def create_custom_shape(name, shape_type):
         s = 0.4
         verts = [(-s, 0, 0), (s, 0, 0), (0, s * 1.5, 0), (-s * 0.6, 0, 0.15), (s * 0.6, 0, 0.15), (0, s, 0.15)]
         edges = [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3), (0, 3), (1, 4), (2, 5)]
+        mesh.from_pydata(verts, edges, [])
+
+    elif shape_type == 'SQUARE':
+        # 垂直于骨轴的正方形环，套在骨头上。和 CIRCLE 同一个平面约定（XZ，y=0）
+        s = 0.5
+        verts = [(-s, 0, -s), (s, 0, -s), (s, 0, s), (-s, 0, s)]
+        edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        mesh.from_pydata(verts, edges, [])
+
+    elif shape_type == 'TWIST_RING':
+        # 扭转控制器专用「转盘」：垂直于骨轴的双环 + 四个刻度 + 一根长指针。
+        # 跟 FK 的单圆环长得完全不一样，一眼能认出来；指针让你看得出转了多少。
+        verts, edges = [], []
+        seg = 32
+        for r in (0.5, 0.62):                      # 双环，比单环显眼
+            o = len(verts)
+            for i in range(seg):
+                a = (i / seg) * 2 * pi
+                verts.append((cos(a) * r, 0, sin(a) * r))
+                edges.append((o + i, o + (i + 1) % seg))
+        for k in range(4):                          # 四个短刻度
+            a = k * pi / 2
+            o = len(verts)
+            verts.append((cos(a) * 0.62, 0, sin(a) * 0.62))
+            verts.append((cos(a) * 0.78, 0, sin(a) * 0.78))
+            edges.append((o, o + 1))
+        o = len(verts)                              # 长指针 + 箭头
+        verts += [(0.62, 0, 0), (1.05, 0, 0),
+                  (0.92, 0, 0.09), (0.92, 0, -0.09)]
+        edges += [(o, o + 1), (o + 1, o + 2), (o + 1, o + 3)]
         mesh.from_pydata(verts, edges, [])
 
     elif shape_type == 'EYE_RING':
@@ -307,8 +366,14 @@ def update_limb_visibility(armature_obj, limb_key):
     ikt = armature.bones.get(IK_TARGET_PREFIX + limb_data["end"])
     if ikt: ikt.hide = not is_ik
 
+    ik_root = armature.bones.get(IK_PREFIX + limb_data["upper"])
     ikp = armature.bones.get(IK_POLE_PREFIX + limb_data["lower"])
-    if ikp: ikp.hide = not is_ik
+    if bend_mode(limb_key) == "pole":
+        if ikp: ikp.hide = not is_ik
+        if ik_root: ik_root.hide = True
+    else:
+        if ik_root: ik_root.hide = not is_ik
+        if ikp: ikp.hide = True
 
     # 脚尖 IK 控制器跟随脚踝开关
     toe_ex_name = limb_data.get("toe_ex")
@@ -334,8 +399,13 @@ def hide_all_internal_bones(armature_obj):
 
         for name in names:
             set_bone_layer_hidden(armature_obj, name)
-            set_bone_layer_hidden(armature_obj, IK_PREFIX + name)
             set_bone_layer_hidden(armature_obj, BIND_PREFIX + name)
+            set_bone_layer_hidden(armature_obj, IK_SWING_PREFIX + name)
+            # 扭转方案下链根骨（大腿）是控制器，不藏；其余 IK_ 骨都是内部骨
+            if name == limb_data["upper"] and bend_mode(limb_key) == "twist":
+                set_bone_layer_control(armature_obj, IK_PREFIX + name, group=ik_group)
+            else:
+                set_bone_layer_hidden(armature_obj, IK_PREFIX + name)
 
             set_bone_layer_control(armature_obj, FK_PREFIX + name, group=fk_group)
             fk_b = armature_obj.data.bones.get(FK_PREFIX + name)
@@ -357,14 +427,24 @@ def hide_all_internal_bones(armature_obj):
             if ikt_toe: ikt_toe.hide = not is_ik
 
         ikt_name = IK_TARGET_PREFIX + limb_data["end"]
-        ikp_name = IK_POLE_PREFIX + limb_data["lower"]
         set_bone_layer_control(armature_obj, ikt_name, group=ik_group)
-        set_bone_layer_control(armature_obj, ikp_name, group=ik_group)
-
         ikt = armature_obj.data.bones.get(ikt_name)
         if ikt: ikt.hide = not is_ik
-        ikp = armature_obj.data.bones.get(ikp_name)
-        if ikp: ikp.hide = not is_ik
+
+        ikp_name = IK_POLE_PREFIX + limb_data["lower"]
+        ik_root = armature_obj.data.bones.get(IK_PREFIX + limb_data["upper"])
+        if bend_mode(limb_key) == "pole":
+            # 极向量方案：方向球是控制器，跟着 IK 模式显隐
+            set_bone_layer_control(armature_obj, ikp_name, group=ik_group)
+            ikp = armature_obj.data.bones.get(ikp_name)
+            if ikp: ikp.hide = not is_ik
+            if ik_root: ik_root.hide = True
+        else:
+            # 扭转方案：链根骨是控制器；遗留的方向球收进隐藏集合
+            if ik_root: ik_root.hide = not is_ik
+            if armature_obj.data.bones.get(ikp_name):
+                set_bone_layer_hidden(armature_obj, ikp_name)
+                armature_obj.data.bones[ikp_name].hide = True
 
 
 def ensure_limb_controller_collections(armature_obj):
@@ -387,7 +467,10 @@ def ensure_limb_controller_collections(armature_obj):
             names.append(limb_data["toe_ex"])
         assignments.extend((FK_PREFIX + name, fk_group) for name in names)
         assignments.append((IK_TARGET_PREFIX + limb_data["end"], ik_group))
-        assignments.append((IK_POLE_PREFIX + limb_data["lower"], ik_group))
+        if bend_mode(limb_key) == "pole":
+            assignments.append((IK_POLE_PREFIX + limb_data["lower"], ik_group))
+        else:
+            assignments.append((IK_PREFIX + limb_data["upper"], ik_group))
         if limb_data.get("toe_ex"):
             assignments.append((IK_TARGET_PREFIX + limb_data["toe_ex"], ik_group))
 
@@ -678,6 +761,108 @@ def solve_pole_angle(context, armature_obj, ik_lower_name, ikp_name):
             best_angle = test_angle
     ik_con.pole_angle = radians(best_angle)
 
+
+def solve_root_twist(context, armature_obj, limb_data, target_point,
+                     max_iter=8, tol_deg=0.15):
+    """解 IK 链根骨（IK_腕 / IK_足）的 Y 轴旋转，把肘/膝送到 target_point。
+
+    v10.5.0 起弃用极向量，弯曲平面改由链根骨绕自身长轴的旋转决定
+    （与 Rigify 手臂 IK 同一路数）。极向量的先天病是解算平面会翻面，
+    旋转式没有这个问题：Y 角是连续量，转到哪停在哪。
+
+    解法是**测量式迭代**，不是扫描：
+      1. 把「肘相对肩→腕主轴的偏移方向」当作方位角，量出当前值和目标值的差
+      2. 按这个差修正根骨 Y 角，再量一次
+      3. 根骨 Y 轴和主轴不共线，所以角度不是 1:1 传递 —— 用前后两次的
+         实测响应算增益，两三轮就收敛
+    每轮只要一次场景求值。原来的 360° 扫描要 99 次，一次 4.5 秒，
+    切换 IK/FK 时卡得没法用（v10.5.0 首版的性能事故）。
+
+    返回最终角度（度）；解不动返回 None。
+    """
+    root_pb = get_pose_bone(armature_obj, IK_PREFIX + limb_data["upper"])
+    low_pb = get_pose_bone(armature_obj, IK_PREFIX + limb_data["lower"])
+    end_pb = get_pose_bone(armature_obj, IK_PREFIX + limb_data["end"])
+    if not (root_pb and low_pb and end_pb) or target_point is None:
+        return None
+    root_pb.rotation_mode = 'XYZ'
+    saved = tuple(root_pb.rotation_euler)
+
+    def sample(deg):
+        """摆到该角度，返回 (肘的方位单位向量, 主轴单位向量, 肘到靶点距离)"""
+        root_pb.rotation_euler = (saved[0], radians(deg), saved[2])
+        context.view_layer.update()
+        root_h = root_pb.head
+        axis = end_pb.head - root_h
+        if axis.length < 1e-9:
+            return None, None, float('inf')
+        axis = axis.normalized()
+        v = low_pb.head - root_h
+        perp = v - axis * v.dot(axis)
+        if perp.length < 1e-7:
+            return None, axis, (low_pb.head - target_point).length
+        return perp.normalized(), axis, (low_pb.head - target_point).length
+
+    def want_perp(axis, root_h):
+        w = target_point - root_h
+        p = w - axis * w.dot(axis)
+        return p.normalized() if p.length > 1e-7 else None
+
+    def signed(a, b, axis):
+        """a 转到 b 需要绕 axis 转多少度（带正负）"""
+        from math import atan2
+        return degrees(atan2(axis.dot(a.cross(b)), max(-1.0, min(1.0, a.dot(b)))))
+
+    theta = degrees(saved[1])
+    best_theta, best_dist = theta, float('inf')
+    gain = 1.0
+    prev_err = None
+    prev_theta = None
+
+    for _ in range(max_iter):
+        cur, axis, dist = sample(theta)
+        if dist < best_dist:
+            best_dist, best_theta = dist, theta
+        if cur is None or axis is None:
+            break
+        want = want_perp(axis, root_pb.head)
+        if want is None:
+            break
+        err = signed(cur, want, axis)
+        if abs(err) <= tol_deg:
+            best_theta, best_dist = theta, dist
+            break
+        # 用上一轮的实测响应校正增益：角度不是 1:1 传的
+        if prev_err is not None and abs(theta - prev_theta) > 1e-6:
+            resp = (prev_err - err) / (theta - prev_theta)
+            if abs(resp) > 1e-3:
+                gain = max(0.2, min(3.0, 1.0 / resp))
+        prev_err, prev_theta = err, theta
+        theta += err * gain
+
+    root_pb.rotation_euler = (saved[0], radians(best_theta), saved[2])
+    context.view_layer.update()
+    return best_theta
+
+
+def rest_bend_point(armature_obj, limb_data, limb_key, bend_dirs=None):
+    """静止姿势下，肘/膝该待的那个点：沿弯向从关节头偏出去一小段。
+
+    生成阶段还没有 FK 姿势可参照，用它给 solve_root_twist 当靶子。
+    """
+    bones = armature_obj.data.bones
+    lower = bones.get(limb_data["lower"])
+    if not lower:
+        return None
+    if bend_dirs and limb_key in bend_dirs:
+        d = Vector(bend_dirs[limb_key])
+    else:
+        d = Vector((0, 1, 0)) if "arm" in limb_key else Vector((0, -1, 0))
+    if d.length < 1e-6:
+        return None
+    offset = 0.4 if "arm" in limb_key else 0.5
+    return lower.head_local + d.normalized() * offset
+
 def remove_rotation_drivers(pb):
     if not pb:
         return
@@ -873,6 +1058,8 @@ class MMIKFK_Properties(bpy.types.PropertyGroup):
         default=False,
     )
 
+
+
 # ============================================================
 # 核心构建系统
 # ============================================================
@@ -925,10 +1112,26 @@ class MMIKFK_OT_Setup(bpy.types.Operator):
                 fk_bones[limb_data["shoulder"]].parent = orig_shoulder.parent
                 ik_bones[limb_data["shoulder"]].parent = orig_shoulder.parent
                 fk_bones[limb_data["upper"]].parent = fk_bones[limb_data["shoulder"]]
-                ik_bones[limb_data["upper"]].parent = ik_bones[limb_data["shoulder"]]
+                upper_parent = ik_bones[limb_data["shoulder"]]
             else:
                 fk_bones[limb_data["upper"]].parent = orig_upper.parent
-                ik_bones[limb_data["upper"]].parent = orig_upper.parent
+                upper_parent = orig_upper.parent
+
+            # 扭转方案（腿）才需要「摆向骨」：照抄 Rigify 的 MCH-*_ik_swing，
+            # 挂一条阻尼追踪指向末端 IK 目标，让扭转控制器的局部 Y 轴恒定
+            # 对齐「髋→踝」主轴。没有这一层的话，控制器的朝向由 IK 解出来的
+            # 关节位置反过来决定，形成回馈，一动坐标轴就乱甩。
+            # 极向量方案（手臂）不需要，链根骨还是内部骨。
+            if bend_mode(limb_key) == "twist":
+                swing_name = IK_SWING_PREFIX + limb_data["upper"]
+                swing = copy_bone(limb_data["upper"], swing_name)
+                swing.parent = upper_parent
+                ik_bones[limb_data["upper"]].parent = swing
+            else:
+                ik_bones[limb_data["upper"]].parent = upper_parent
+                legacy_swing = armature.edit_bones.get(IK_SWING_PREFIX + limb_data["upper"])
+                if legacy_swing:
+                    armature.edit_bones.remove(legacy_swing)
 
             if limb_data.get("twist"):
                 twist_name = limb_data["twist"]
@@ -954,7 +1157,7 @@ class MMIKFK_OT_Setup(bpy.types.Operator):
                 already_bent = seg1.angle(seg2) > radians(5.0)
             is_arm_limb = "arm" in limb_key
             if already_bent:
-                # 记录既有弯向，供极向量摆放和笔直退化兜底
+                # 记录既有弯向，供扭转角求解和笔直退化兜底
                 axis_v = ik_end_eb.head - ik_upper.head
                 if axis_v.length > 1e-6:
                     an = axis_v.normalized()
@@ -1007,22 +1210,32 @@ class MMIKFK_OT_Setup(bpy.types.Operator):
                     ikt_toe.parent = ikt  # 跟随脚踝 IK 目标
 
             ikp_name = IK_POLE_PREFIX + limb_data["lower"]
-            ikp = armature.edit_bones.get(ikp_name)
-            if not ikp:
-                ikp = armature.edit_bones.new(ikp_name)
-                l_pos = orig_lower.head
-                if limb_key in bend_dirs:
-                    pole_dir = Vector(bend_dirs[limb_key])
-                else:
-                    pole_dir = Vector((0, 1, 0)) if "arm" in limb_key else Vector((0, -1, 0))
-                offset = 0.4 if "arm" in limb_key else 0.5
-                ikp.head = l_pos + pole_dir * offset
-                ikp.tail = ikp.head + pole_dir * 0.06
-                ikp.use_deform = False
+            if bend_mode(limb_key) == "pole":
+                # 极向量方案（手臂）：方向球照 v1043 的做法生成
+                ikp = armature.edit_bones.get(ikp_name)
+                if not ikp:
+                    ikp = armature.edit_bones.new(ikp_name)
+                    l_pos = orig_lower.head
+                    if limb_key in bend_dirs:
+                        pole_dir = Vector(bend_dirs[limb_key])
+                    else:
+                        pole_dir = Vector((0, 1, 0)) if "arm" in limb_key else Vector((0, -1, 0))
+                    offset = 0.4 if "arm" in limb_key else 0.5
+                    ikp.head = l_pos + pole_dir * offset
+                    ikp.tail = ikp.head + pole_dir * 0.06
+                    ikp.use_deform = False
+                # 方向球挂在「全ての親」下（岁岁 2026-08-16 拍板）。三种组合里的第三种：
+                #   挂 IKT_（v10.4.4）→ 拖手腕球跟着跑，肘朝向被锁死
+                #   无父级（v1043）    → 球留在世界空间，搬动角色时球掉队
+                #   挂 全ての親（现在）→ 拖手腕球不动，搬动角色球跟着走
+                # 找不到总控骨时回退为无父级，等价于 v1043。
+                ikp.parent = armature.edit_bones.get("全ての親")
+            else:
+                # 扭转方案（腿）：不需要方向球，顺手清掉旧工程的残留
+                legacy_ikp = armature.edit_bones.get(ikp_name)
+                if legacy_ikp:
+                    armature.edit_bones.remove(legacy_ikp)
 
-            # 肘/膝极向量跟随对应的手腕/脚踝 IK 目标，同时保留局部偏移，
-            # 移动末端控制器时弯曲方向控制器会一起移动。
-            ikp.parent = ikt
 
         armature["mmikfk_bend_dirs"] = bend_dirs
 
@@ -1034,7 +1247,11 @@ class MMIKFK_OT_Setup(bpy.types.Operator):
         fk_arm_shape = create_custom_shape("MMD_FK_Arm_Shape", 'CUBE_FRAME')
         arm_target_shape = create_custom_shape("MMD_IK_Arm_Target", 'CUBE_FRAME')
         foot_target_shape = create_custom_shape("MMD_IK_Foot_Target", 'FOOT_SHAPE')
+        # v10.5.0：链根骨的扭转控制器，用圆环提示「转它」
         pole_shape = create_custom_shape("MMD_IK_Shape_Sphere", 'SPHERE')
+        twist_shape = create_custom_shape("MMD_IK_Shape_Twist", 'TWIST_RING')
+        square_shape = create_custom_shape("MMD_IK_Shape_Square", 'SQUARE')
+        cube_shape = create_custom_shape("MMD_IK_Shape_Cube", 'CUBE_FRAME')
         toe_shape = create_custom_shape("MMD_Toe_Shape", 'TOE_SHAPE')
 
         for limb_key, limb_data in MMD_BONE_MAP.items():
@@ -1100,16 +1317,49 @@ class MMIKFK_OT_Setup(bpy.types.Operator):
             ik_con.target = armature_obj
             ik_con.subtarget = IK_TARGET_PREFIX + end_name
             ik_con.chain_count = limb_data["chain_count"]
-            ik_con.pole_target = armature_obj
-            ik_con.pole_subtarget = IK_POLE_PREFIX + lower_name
+            if bend_mode(limb_key) == "pole":
+                ik_con.pole_target = armature_obj
+                ik_con.pole_subtarget = IK_POLE_PREFIX + lower_name
+            else:
+                # 扭转方案：显式清空，旧工程重新生成时才能把极向量摘干净
+                ik_con.pole_target = None
+                ik_con.pole_subtarget = ""
+                ik_con.pole_angle = 0.0
+
+            # v10.5.0：肘部铰链限制功能已按岁岁要求移除。老工程里 IK_ 肘骨上
+            # 可能还留着上一版写进去的锁和角度范围，这里显式解开，
+            # 否则重新生成后限制还在，等于没删掉。
+            ik_lower_clear = get_pose_bone(armature_obj, IK_PREFIX + lower_name)
+            if ik_lower_clear:
+                ik_lower_clear.lock_ik_x = False
+                ik_lower_clear.lock_ik_y = False
+                ik_lower_clear.lock_ik_z = False
+                for _ax in "xyz":
+                    setattr(ik_lower_clear, "use_ik_limit_" + _ax, False)
+                    setattr(ik_lower_clear, "ik_min_" + _ax, 0.0)
+                    setattr(ik_lower_clear, "ik_max_" + _ax, 0.0)
 
             if twist_name:
                 ik_twist_pb = get_pose_bone(armature_obj, IK_PREFIX + twist_name)
                 if ik_twist_pb:
                     ik_twist_pb.lock_ik_x, ik_twist_pb.lock_ik_y, ik_twist_pb.lock_ik_z = True, True, True
 
-            solve_pole_angle(context, armature_obj, IK_PREFIX + lower_name, IK_POLE_PREFIX + lower_name)
-            ikp_pb = get_pose_bone(armature_obj, IK_POLE_PREFIX + lower_name)
+            # 曾经在这里挂过「触及范围限制」(LIMIT_DISTANCE)，已撤销：
+            # Blender 的 IK 默认不拉伸骨头，目标拉出射程只会伸直指过去，
+            # 夹不夹对姿势没有区别；而它开的 use_transform_limit 会在按 G 拖动时
+            # 把夹持结果回写进骨骼位置，形成回馈，控制器自己跑飞。
+            # 这一句留着，好让装过那一版的工程重新生成时自动摘干净
+            ikt_pb = get_pose_bone(armature_obj, IK_TARGET_PREFIX + end_name)
+            if ikt_pb:
+                remove_constraint_if_exists(ikt_pb, "REACH_CLAMP")
+
+            if bend_mode(limb_key) == "pole":
+                solve_pole_angle(context, armature_obj,
+                                 IK_PREFIX + lower_name, IK_POLE_PREFIX + lower_name)
+            else:
+                # 用链根骨的 Y 旋转把膝摆到静止弯向上
+                solve_root_twist(context, armature_obj, limb_data,
+                                 rest_bend_point(armature_obj, limb_data, limb_key, bend_dirs))
 
             ik_end_pb = get_pose_bone(armature_obj, IK_PREFIX + end_name)
             remove_constraint_if_exists(ik_end_pb, "IK_ROT")
@@ -1127,9 +1377,48 @@ class MMIKFK_OT_Setup(bpy.types.Operator):
                 ikt_pb.custom_shape_scale_xyz = (0.8, 0.8, 0.8)
             ikt_pb.color.palette = 'THEME01'
 
-            ikp_pb.custom_shape = pole_shape
-            ikp_pb.color.palette = 'THEME03'
-            ikp_pb.custom_shape_scale_xyz = (1.25, 1.25, 1.25)
+            # 摆向骨：阻尼追踪末端 IK 目标，让下面的扭转控制器的 Y 轴
+            # 恒定对齐「肩→腕 / 髋→踝」这条主轴。没有这一层的话，控制器的
+            # 朝向由 IK 解出来的关节位置反过来决定，一动坐标轴就乱甩。
+            swing_pb = get_pose_bone(armature_obj, IK_SWING_PREFIX + upper_name)
+            if swing_pb:
+                remove_constraint_if_exists(swing_pb, "IK_SWING")
+                dt = swing_pb.constraints.new('DAMPED_TRACK')
+                dt.name = "IK_SWING"
+                dt.target = armature_obj
+                dt.subtarget = IK_TARGET_PREFIX + end_name
+                dt.track_axis = 'TRACK_Y'
+
+            if bend_mode(limb_key) == "pole":
+                # 极向量方案（手臂）：方向球是控制器，链根骨回归内部骨
+                ikp_pb = get_pose_bone(armature_obj, IK_POLE_PREFIX + lower_name)
+                if ikp_pb:
+                    ikp_pb.custom_shape = pole_shape
+                    ikp_pb.color.palette = 'THEME03'
+                    ikp_pb.custom_shape_scale_xyz = (1.25, 1.25, 1.25)
+                ik_root_pb = get_pose_bone(armature_obj, IK_PREFIX + upper_name)
+                if ik_root_pb:
+                    ik_root_pb.custom_shape = None
+                    ik_root_pb.custom_shape_translation = (0.0, 0.0, 0.0)
+                    ik_root_pb.lock_rotation = (False, False, False)
+                    ik_root_pb.lock_location = (False, False, False)
+                    ik_root_pb.lock_scale = (False, False, False)
+            else:
+                # 扭转方案（腿）：控制权交给链根骨 IK_足。
+                # 选中它按 R Y 绕自身长轴转，膝就绕着主轴转 —— 不会翻面。
+                ik_root_pb = get_pose_bone(armature_obj, IK_PREFIX + upper_name)
+                if ik_root_pb:
+                    # 绿色正方体线框，放在大腿根部（骨的原点，也就是坐标轴那个位置）。
+                    # 岁岁 2026-08-16 要求：比正方形环再小一半，挪到根部。
+                    ik_root_pb.custom_shape = cube_shape
+                    ik_root_pb.color.palette = 'THEME03'
+                    ik_root_pb.custom_shape_scale_xyz = (0.5, 0.5, 0.5)
+                    ik_root_pb.custom_shape_translation = (0.0, 0.0, 0.0)
+                    ik_root_pb.rotation_mode = 'XYZ'
+                    ik_root_pb.lock_location = (True, True, True)
+                    ik_root_pb.lock_scale = (True, True, True)
+                    # 只放开绕骨自身长轴（Y）的旋转，X/Z 锁死免得把解算平面搅乱
+                    ik_root_pb.lock_rotation = (True, False, True)
 
             # 脚尖控制器：纯旋转手柄，位置由脚踝层级决定
             if toe_ex_name:
@@ -1640,17 +1929,17 @@ class MMIKFK_OT_SnapIKtoFK(bpy.types.Operator):
         upper_pb = get_pose_bone(armature_obj, limb_data["upper"])
         lower_pb = get_pose_bone(armature_obj, limb_data["lower"])
         end_pb = get_pose_bone(armature_obj, limb_data["end"])
-        ik_pole = get_pose_bone(armature_obj, IK_POLE_PREFIX + limb_data["lower"])
-
-        if upper_pb and lower_pb and end_pb and ik_pole:
+        if upper_pb and lower_pb and end_pb:
             u_head = upper_pb.matrix.translation
             l_head = lower_pb.matrix.translation
             e_head = end_pb.matrix.translation
 
             offset = 0.4 if "arm" in self.limb else 0.5
 
-            # 在当前 FK 弯曲平面内，沿肘/膝凸出的方向放置极向量
-            # 这样 IK 解算器才能用 setup 阶段固定下来的 pole_angle 还原出与 FK 一致的肘/膝位置
+            # v10.5.0：不再摆极向量，改成解链根骨的 Y 旋转。
+            # 靶子直接用 FK 当前的肘/膝头位置，比"先求方向再放球"更准，
+            # 因为它绕开了 pole_angle 这一层换算。
+            # 下面这段求 bend 的逻辑保留：链条笔直时靶子退化，仍要靠弯向兜底。
             pole_dir = None
             chain = e_head - u_head
             chain_len = chain.length
@@ -1679,12 +1968,23 @@ class MMIKFK_OT_SnapIKtoFK(bpy.types.Operator):
             if pole_dir is None:
                 stored = armature_obj.data.get("mmikfk_bend_dirs")
                 if stored and self.limb in stored.keys():
-                    pole_dir = Vector(stored[self.limb]).normalized()
+                    fallback_dir = Vector(stored[self.limb]).normalized()
                 else:
                     sign = 1.0 if not armature_obj.mmikfk_props.prebend_invert else -1.0
-                    pole_dir = Vector((0, sign, 0)) if "arm" in self.limb else Vector((0, -sign, 0))
+                    fallback_dir = Vector((0, sign, 0)) if "arm" in self.limb else Vector((0, -sign, 0))
+            else:
+                fallback_dir = pole_dir
 
-            ik_pole.matrix = Matrix.Translation(l_head + pole_dir * offset)
+            if bend_mode(self.limb) == "pole":
+                # 极向量方案：照 10.4.x 原样，把方向球摆到弯曲平面上
+                ik_pole = get_pose_bone(armature_obj, IK_POLE_PREFIX + limb_data["lower"])
+                if ik_pole:
+                    ik_pole.matrix = Matrix.Translation(l_head + fallback_dir * offset)
+            else:
+                # 扭转方案：pole_dir 有值 = 用户确实摆弯了，FK 关节的实际位置
+                # 就是最好的靶子；笔直时用弯向推一个靶点
+                target = l_head if pole_dir is not None else (l_head + fallback_dir * offset * 0.25)
+                solve_root_twist(context, armature_obj, limb_data, target)
 
         context.view_layer.update()
         return {'FINISHED'}
@@ -1811,7 +2111,10 @@ class MMIKFK_OT_KeyframeAll(bpy.types.Operator):
         armature_obj.keyframe_insert(data_path=f'mmikfk_props.{prop_name}', frame=frame)
 
         if is_ik:
-            ik_controllers = [IK_TARGET_PREFIX + limb_data["end"], IK_POLE_PREFIX + limb_data["lower"]]
+            ik_controllers = [IK_TARGET_PREFIX + limb_data["end"],
+                              (IK_POLE_PREFIX + limb_data["lower"])
+                              if bend_mode(limb_key) == "pole"
+                              else (IK_PREFIX + limb_data["upper"])]
             if limb_data.get("shoulder"): ik_controllers.append(IK_PREFIX + limb_data["shoulder"])
             for ik_name in ik_controllers:
                 pb = get_pose_bone(armature_obj, ik_name)
@@ -1931,7 +2234,7 @@ class MMIKFK_OT_AbsorbPose(bpy.types.Operator):
             # 消费掉原生 IK 骨（足ＩＫ/つま先ＩＫ/足IK親）的残值：腿型已烘进 FK，
             # 留着会在导出时双重。肩P/上半身3 这类祖先骨的残值保留——
             # 它们不在采样的局部值里，留着才能继续贡献姿势
-            all_prefixes = (FK_PREFIX, IK_PREFIX, IK_TARGET_PREFIX, IK_POLE_PREFIX,
+            all_prefixes = (FK_PREFIX, IK_PREFIX, IK_TARGET_PREFIX, IK_POLE_PREFIX, IK_SWING_PREFIX,
                             CTRL_PREFIX, BEND_PREFIX, AUTO_PREFIX, BIND_PREFIX)
             for pb in armature_obj.pose.bones:
                 nm = pb.name
@@ -2377,7 +2680,7 @@ class MMIKFK_OT_AutoBendFK(bpy.types.Operator):
 
 class MMIKFK_OT_CalibrateBend(bpy.types.Operator):
     """自动弯向判错时用：先用 FK 把手肘/膝盖朝正确方向掰一点，
-    再点此按钮，按当前摆出的弯曲平面重建 IK 弯向、极向量和 pole_angle。
+    再点此按钮，按当前摆出的弯曲平面重建 IK 弯向和链根骨的扭转角。
     全程不修改模型骨架。"""
     bl_idname = "mmikfk.calibrate_bend"
     bl_label = "按当前姿势校准弯向"
@@ -2432,9 +2735,10 @@ class MMIKFK_OT_CalibrateBend(bpy.types.Operator):
                                      "让关节折出角度再校准。转大臂/大腿没有用")
             return {'CANCELLED'}
 
-        # 重弯 IK 层 + 重摆极向量。肘/膝先投影回肩→腕弦线再朝校准方向偏移：
+        # 重弯 IK 层。肘/膝先投影回肩→腕弦线再朝校准方向偏移：
         # 模型自带预弯（如被旧版物理预弯过）也会被校准方向完全接管，不被压制
         bend_dirs = dict(armature.get("mmikfk_bend_dirs", {}))
+        calib_targets = {}   # v10.5.0：每肢体的靶点，出编辑模式后拿去解扭转角
         bpy.ops.object.mode_set(mode='EDIT')
         ebs = armature.edit_bones
         for limb_key, bend_dir in new_dirs.items():
@@ -2458,20 +2762,26 @@ class MMIKFK_OT_CalibrateBend(bpy.types.Operator):
             new_head = foot + bend_dir * amt
             ik_lower.head = new_head
             ik_upper.tail = new_head.copy()
-            ikp = ebs.get(IK_POLE_PREFIX + limb_data["lower"])
-            if ikp:
-                offset = 0.4 if "arm" in limb_key else 0.5
-                ikp.head = foot + bend_dir * offset
-                ikp.tail = ikp.head + bend_dir * 0.06
             bend_dirs[limb_key] = list(bend_dir)
+            off = 0.4 if "arm" in limb_key else 0.5
+            if bend_mode(limb_key) == "pole":
+                ikp = ebs.get(IK_POLE_PREFIX + limb_data["lower"])
+                if ikp:
+                    ikp.head = foot + bend_dir * off
+                    ikp.tail = ikp.head + bend_dir * 0.06
+            else:
+                calib_targets[limb_key] = foot + bend_dir * off
 
-        # 重解 pole_angle
         bpy.ops.object.mode_set(mode='POSE')
         for limb_key in new_dirs:
             limb_data = MMD_BONE_MAP[limb_key]
-            solve_pole_angle(context, armature_obj,
-                             IK_PREFIX + limb_data["lower"],
-                             IK_POLE_PREFIX + limb_data["lower"])
+            if bend_mode(limb_key) == "pole":
+                solve_pole_angle(context, armature_obj,
+                                 IK_PREFIX + limb_data["lower"],
+                                 IK_POLE_PREFIX + limb_data["lower"])
+            else:
+                solve_root_twist(context, armature_obj, limb_data,
+                                 calib_targets.get(limb_key))
 
         armature["mmikfk_bend_dirs"] = bend_dirs
 
@@ -2579,7 +2889,7 @@ class MMIKFK_OT_Cleanup(bpy.types.Operator):
 
         bpy.ops.object.mode_set(mode='EDIT')
         for b in list(armature_obj.data.edit_bones):
-            if any(b.name.startswith(p) for p in [FK_PREFIX, IK_PREFIX, IK_TARGET_PREFIX, IK_POLE_PREFIX, CTRL_PREFIX, AUTO_PREFIX, BEND_PREFIX, BIND_PREFIX]):
+            if any(b.name.startswith(p) for p in [FK_PREFIX, IK_PREFIX, IK_TARGET_PREFIX, IK_POLE_PREFIX, IK_SWING_PREFIX, CTRL_PREFIX, AUTO_PREFIX, BEND_PREFIX, BIND_PREFIX, IK_REACH_PREFIX]):
                 armature_obj.data.edit_bones.remove(b)
 
         bpy.ops.object.mode_set(mode='POSE')
@@ -2618,6 +2928,7 @@ POSE_EXPORT_PREFIXES = (
     FK_PREFIX,
     IK_TARGET_PREFIX,
     IK_POLE_PREFIX,
+    IK_SWING_PREFIX,
     CTRL_PREFIX,
     BEND_PREFIX,
 )
@@ -2987,7 +3298,7 @@ class MMIKFK_PT_MainPanel(bpy.types.Panel):
             row = box.row(align=True)
             icon = 'TRIA_DOWN' if is_open_prebend else 'TRIA_RIGHT'
             row.prop(props, "ui_show_prebend", icon=icon,
-                     text="预弯曲（修正 IK 极向量方向）", emboss=False)
+                     text="预弯曲（修正 IK 弯曲方向）", emboss=False)
         else:
             is_open_prebend = False
 
